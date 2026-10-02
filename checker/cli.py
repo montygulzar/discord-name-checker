@@ -50,7 +50,9 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--progress-file", default="checked.txt", help="progress file for --resume")
     run.add_argument("--min-delay", type=float, default=0.0,
                      help="minimum seconds between requests (default 0: pace from Discord's headers)")
-    run.add_argument("--proxy", default=None, help="http://user:pass@host:port (or PROXY in .env)")
+    run.add_argument("--proxy", action="append", default=[],
+                     help="http://user:pass@host:port, repeatable for failover (or PROXY in .env, comma-separated)")
+    run.add_argument("--proxy-file", help="file of proxies, one per line, used for failover")
     run.add_argument("--webhook", default=None,
                      help="send hits to this URL / Discord webhook (or WEBHOOK_URL in .env)")
     run.add_argument("--webhook-header", action="append", default=[],
@@ -90,7 +92,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     load_dotenv(args.env_file)
 
     token = os.environ.get("DISCORD_TOKEN") or None
-    proxy = args.proxy or os.environ.get("PROXY") or None
+    proxies = list(args.proxy)
+    if args.proxy_file:
+        with open(args.proxy_file, encoding="utf-8") as f:
+            proxies += [line.strip() for line in f if line.strip() and not line.startswith("#")]
+    if not proxies and os.environ.get("PROXY"):
+        proxies = [p.strip() for p in os.environ["PROXY"].split(",") if p.strip()]
     webhook = args.webhook or os.environ.get("WEBHOOK_URL") or None
 
     names, total = pick_names(args)
@@ -101,7 +108,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             total = None  # unknown overlap; don't print a misleading total
 
     try:
-        checker = discord_api.DiscordChecker(token=token, proxy=proxy, min_delay=args.min_delay)
+        checker = discord_api.DiscordChecker(token=token, proxies=proxies, min_delay=args.min_delay)
     except discord_api.ProxyError as exc:
         raise SystemExit(f"proxy error: {exc}")
 
@@ -115,8 +122,12 @@ def main(argv: Optional[list[str]] = None) -> int:
                             on_error=lambda msg: print(f"\n[webhook] {msg}", file=sys.stderr))
 
     mode = "token" if token else "no token"
-    print(f"Checking via Discord ({mode}{', proxy' if proxy else ''}"
-          f"{', webhook' if webhook else ''}). Hits -> {args.output}. Ctrl+C to stop.")
+    extras = [mode]
+    if proxies:
+        extras.append(f"{len(proxies)} {'proxies' if len(proxies) > 1 else 'proxy'}")
+    if webhook:
+        extras.append("webhook")
+    print(f"Checking via Discord ({', '.join(extras)}). Hits -> {args.output}. Ctrl+C to stop.")
 
     checked = hits = errors = streak = 0
     start = time.monotonic()

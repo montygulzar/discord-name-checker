@@ -165,6 +165,27 @@ class ProxyTests(unittest.TestCase):
         self.assertEqual(tunnel.call_args.args[:2], ("discord.com", 443))
         self.assertIn("Proxy-Authorization", tunnel.call_args.kwargs["headers"])
 
+    def test_failover_to_next_proxy_on_network_error(self):
+        checker = DiscordChecker(proxies=["http://1.1.1.1:80", "http://2.2.2.2:80"],
+                                 sleep=lambda s: None)
+        used = []
+        responses = [OSError("proxy down"), FakeResponse(200, {"taken": False})]
+
+        def connect():
+            used.append(checker.proxies[checker._proxy_idx][0])
+            return FakeConn([responses.pop(0)])
+
+        checker._connect = connect
+        self.assertEqual(checker.check("abc").status, discord_api.AVAILABLE)
+        self.assertEqual(used, ["1.1.1.1", "2.2.2.2"])
+
+    def test_429_does_not_switch_proxy(self):
+        checker, _, _ = make_checker([FakeResponse(429, {"retry_after": 0.1}),
+                                      FakeResponse(200, {"taken": True})],
+                                     proxies=["http://1.1.1.1:80", "http://2.2.2.2:80"])
+        checker.check("abc")
+        self.assertEqual(checker._proxy_idx, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

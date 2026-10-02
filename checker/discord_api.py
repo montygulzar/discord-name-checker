@@ -64,6 +64,7 @@ class DiscordChecker:
         self,
         token: Optional[str] = None,
         proxy: Optional[str] = None,
+        proxies: Optional[list[str]] = None,
         min_delay: float = 0.0,
         max_retries: int = 6,
         timeout: float = 15.0,
@@ -72,7 +73,10 @@ class DiscordChecker:
     ):
         self.token = token
         self.path = AUTHED_PATH if token else UNAUTHED_PATH
-        self.proxy = parse_proxy(proxy) if proxy else None
+        # A list is for failover only: we move to the next proxy when the
+        # current one can't be reached, never to dodge Discord's rate limits.
+        self.proxies = [parse_proxy(p) for p in ([proxy] if proxy else []) + (proxies or [])]
+        self._proxy_idx = 0
         self.min_delay = min_delay
         self.max_retries = max_retries
         self.timeout = timeout
@@ -92,8 +96,8 @@ class DiscordChecker:
     # -- connection ---------------------------------------------------------
 
     def _connect(self) -> http.client.HTTPSConnection:
-        if self.proxy:
-            host, port, tunnel_headers = self.proxy
+        if self.proxies:
+            host, port, tunnel_headers = self.proxies[self._proxy_idx]
             conn = http.client.HTTPSConnection(host, port, timeout=self.timeout, context=self._ssl)
             conn.set_tunnel(HOST, 443, headers=tunnel_headers)
         else:
@@ -149,8 +153,10 @@ class DiscordChecker:
             try:
                 status, headers, raw = self._post(name)
             except (http.client.HTTPException, OSError) as exc:
-                # dropped keep-alive, proxy hiccup, timeout: reconnect and retry
+                # dropped keep-alive, dead proxy, timeout: reconnect and retry
                 self.close()
+                if len(self.proxies) > 1:
+                    self._proxy_idx = (self._proxy_idx + 1) % len(self.proxies)
                 last_detail = f"network: {exc}"
                 self._block_for(min(2 ** attempt, 30) * 0.5)
                 continue

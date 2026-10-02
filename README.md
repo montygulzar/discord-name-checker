@@ -16,6 +16,28 @@ It uses only the Python standard library (3.9+), so there's nothing to install.
 git clone https://github.com/montygulzar/discord-name-checker
 cd discord-name-checker
 cp .env.example .env          # optional: token, proxy, webhook
+python main.py                # interactive menu
+```
+
+Running with no arguments shows a menu:
+
+```
+Length?
+  1: 3
+  2: 4
+  3: 3 + 4
+
+What type?
+  1: Letters  (a-z)          -> L
+  2: Numbers  (0-9)          -> N
+  3: Chars    (a-z 0-9 _ .)  -> C
+  4: Custom characters
+  5: Wordlist file (ignores length)
+```
+
+Or skip the menu with flags:
+
+```bash
 python main.py --length 3 --mode letters      # 3L
 python main.py --length 4 --mode numbers      # 4N
 python main.py --length 3 4 --mode chars --shuffle   # 3C + 4C, random order
@@ -35,7 +57,8 @@ Available names are printed, appended to `available.txt`, and sent to your webho
 | `-o/--output FILE` | Where hits go (default `available.txt`) |
 | `--resume` | Skip names already in `checked.txt` from a previous run |
 | `--min-delay SEC` | Force a minimum gap between requests (default 0) |
-| `--proxy URL` | Route requests through an HTTP proxy |
+| `--proxy URL` | Route requests through an HTTP proxy (repeatable for failover) |
+| `--proxy-file FILE` | Proxies, one per line, for failover |
 | `--webhook URL` | Send each hit to your server or a Discord webhook |
 | `--webhook-header 'Name: value'` | Extra header for the webhook (e.g. auth), repeatable |
 
@@ -63,7 +86,7 @@ Consider using an alt account: automated checking is against Discord's Terms of 
   it stops instead of burning through the list.
 
 The rate limit applies per IP and per account, so the fastest way to finish a big
-list is to let it run. It doesn't rotate proxies or tokens.
+list is to let it run. It doesn't rotate proxies or tokens to get around Discord's limits.
 
 ## Proxy
 
@@ -73,7 +96,13 @@ It doesn't make checking faster.
 
 ```
 PROXY=http://user:pass@host:port
+# or several, comma-separated, for failover:
+PROXY=http://a:b@host1:port,http://a:b@host2:port
 ```
+
+With several proxies, the checker uses the first one and moves to the next only when it
+can't connect (dead proxy, timeout). Rate-limit responses are waited out, never dodged
+by switching proxies.
 
 Only HTTP proxies (the usual kind providers sell) are supported. The connection to
 Discord is still TLS-encrypted end-to-end through the proxy's CONNECT tunnel.
