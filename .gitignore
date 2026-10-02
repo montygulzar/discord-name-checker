@@ -1,0 +1,5 @@
+.env
+available.txt
+checked.txt
+__pycache__/
+*.pyc
