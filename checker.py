@@ -1,44 +1,70 @@
 #!/usr/bin/env python3
 """
-discord name checker — pomelo availability sniper
+discord name checker — pomelo availability sniper (v2)
 
-hits discord's unauthed username-attempt endpoint concurrently, rotates proxies,
-tracks hits/takens/errors live, dumps claimable names to disk.
+async checker against discord's unauthed pomelo endpoint. shared session with
+per-request proxy, circuit breaker on connection floods, webhook batching,
+proxy scoring + auto-prune.
 
 usage:
-    python checker.py --wordlist names.txt --concurrency 50
-    python checker.py --generate 4 --charset alpha --concurrency 100
-    python checker.py --wordlist names.txt --proxies proxies.txt --out hits.txt
+    python checker.py --wordlist names.txt
+    python checker.py --generate 4 --charset alnum --shuffle --proxies proxies.txt -j 400 -d 2
+    python checker.py --wordlist names.txt --proxies proxies.txt --webhook https://discord.com/api/webhooks/.../...
 """
 
 from __future__ import annotations
+
+# ─── py 3.13+ SSL EOF fix (lifted from Cloudzik's engine) ─────────────────
+import asyncio.sslproto as _sslproto
+
+_orig_eof = _sslproto.SSLProtocol.eof_received
+
+
+def _safe_eof(self):
+    try:
+        return _orig_eof(self)
+    except RuntimeError:
+        return False
+
+
+_sslproto.SSLProtocol.eof_received = _safe_eof
+# ──────────────────────────────────────────────────────────────────────────
 
 import argparse
 import asyncio
 import itertools
 import json
+import logging
 import random
 import re
 import signal
 import string
 import sys
 import time
+import warnings
+from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import AsyncIterator, Iterable, Optional
 
 import aiohttp
-from aiohttp_socks import ProxyConnector
 from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+# silence noisy windows proactor tracebacks
+warnings.filterwarnings("ignore", category=ResourceWarning)
+logging.getLogger("asyncio").setLevel(logging.CRITICAL)
+if sys.platform == "win32":
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    except Exception:
+        pass
+
 ENDPOINT = "https://discord.com/api/v9/unique-username/username-attempt-unauthed"
 
-# pomelo rules: 2-32 chars, lowercase letters, digits, underscore, period.
-# periods can't lead/trail or repeat. we validate client-side before burning a request.
 VALID = re.compile(r"^(?!.*\.\.)(?!\.)(?!.*\.$)[a-z0-9_.]{2,32}$")
 
 UA_POOL = [
@@ -53,14 +79,16 @@ UA_POOL = [
 
 @dataclass
 class Stats:
-    checked: int = 0
+    requests: int = 0          # every HTTP attempt (incl. 429s)
+    checked: int = 0           # names with a verdict (taken/available)
     available: int = 0
     taken: int = 0
     invalid: int = 0
     errors: int = 0
     rate_limited: int = 0
+    circuit_opens: int = 0
     started: float = field(default_factory=time.monotonic)
-    recent_hits: list[str] = field(default_factory=list)
+    recent_hits: list = field(default_factory=list)
 
     @property
     def elapsed(self) -> float:
@@ -68,29 +96,41 @@ class Stats:
 
     @property
     def rps(self) -> float:
+        return self.requests / self.elapsed
+
+    @property
+    def check_rps(self) -> float:
         return self.checked / self.elapsed
 
 
 @dataclass
 class ProxyPool:
-    proxies: list[str]
+    """Round-robin pool with per-proxy scoring and auto-dead-marking."""
+    proxies: list = field(default_factory=list)
     idx: int = 0
     dead: set = field(default_factory=set)
+    score: dict = field(default_factory=lambda: defaultdict(int))
 
     def next(self) -> Optional[str]:
         if not self.proxies:
             return None
         alive = [p for p in self.proxies if p not in self.dead]
         if not alive:
-            # everyone's dead — unmark and try again rather than crashing
             self.dead.clear()
             alive = self.proxies
         p = alive[self.idx % len(alive)]
         self.idx += 1
         return p
 
-    def mark_dead(self, proxy: Optional[str]) -> None:
+    def hit(self, proxy: Optional[str]) -> None:
         if proxy:
+            self.score[proxy] = min(self.score[proxy] + 1, 10)
+
+    def miss(self, proxy: Optional[str], kill_at: int = -6) -> None:
+        if not proxy:
+            return
+        self.score[proxy] -= 1
+        if self.score[proxy] <= kill_at:
             self.dead.add(proxy)
 
     @property
@@ -98,11 +138,98 @@ class ProxyPool:
         return max(len(self.proxies) - len(self.dead), 0)
 
 
+class CircuitBreaker:
+    """Pauses all workers briefly after a burst of failures (Cloudzik-style)."""
+
+    def __init__(self, threshold: int = 20, window: float = 2.0, cooldown: float = 2.0) -> None:
+        self.threshold = threshold
+        self.window = window
+        self.cooldown = cooldown
+        self._fails: list = []
+        self._open_until = 0.0
+
+    def record_failure(self) -> bool:
+        now = time.monotonic()
+        self._fails.append(now)
+        self._fails = [t for t in self._fails if now - t < self.window]
+        if len(self._fails) >= self.threshold:
+            self._open_until = now + self.cooldown
+            self._fails.clear()
+            return True
+        return False
+
+    async def wait_if_open(self) -> None:
+        now = time.monotonic()
+        if now < self._open_until:
+            await asyncio.sleep(self._open_until - now)
+
+
+class WebhookBatcher:
+    """Buffers hits and dispatches to a Discord webhook in rate-safe batches."""
+
+    MAX_CHARS = 1900
+    BATCH = 15
+    INTERVAL = 3.0
+
+    def __init__(self, url: str, session: aiohttp.ClientSession) -> None:
+        self.url = url
+        self.session = session
+        self.queue: asyncio.Queue = asyncio.Queue()
+        self._stop = asyncio.Event()
+
+    def enqueue(self, name: str) -> None:
+        try:
+            self.queue.put_nowait(name)
+        except Exception:
+            pass
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    async def run(self) -> None:
+        buf: list = []
+        last = time.monotonic()
+        while not self._stop.is_set():
+            try:
+                name = await asyncio.wait_for(self.queue.get(), timeout=1.0)
+                buf.append(name)
+            except asyncio.TimeoutError:
+                pass
+            now = time.monotonic()
+            if buf and (len(buf) >= self.BATCH or now - last >= self.INTERVAL):
+                await self._flush(buf)
+                buf = []
+                last = now
+        if buf:
+            await self._flush(buf)
+
+    async def _flush(self, names: list) -> None:
+        msg = "\n".join(f"`{n}` is **available** <t:{int(time.time())}:R>" for n in names)
+        if len(msg) > self.MAX_CHARS:
+            msg = msg[: self.MAX_CHARS - 3] + "..."
+        for _ in range(3):
+            try:
+                async with self.session.post(
+                    self.url,
+                    json={"content": msg, "username": "name-checker"},
+                ) as r:
+                    if r.status == 429:
+                        try:
+                            d = await r.json()
+                            await asyncio.sleep(float(d.get("retry_after", 2)))
+                        except Exception:
+                            await asyncio.sleep(2)
+                        continue
+                    return
+            except Exception:
+                await asyncio.sleep(1)
+
+
 def valid_name(name: str) -> bool:
     return bool(VALID.match(name))
 
 
-def load_lines(path: Path) -> list[str]:
+def load_lines(path: Path) -> list:
     out = []
     with path.open("r", encoding="utf-8", errors="ignore") as f:
         for line in f:
@@ -112,73 +239,69 @@ def load_lines(path: Path) -> list[str]:
     return out
 
 
-def generate(length: int, charset: str) -> Iterable[str]:
+def generate(length: int, charset: str, shuffle: bool = False) -> Iterable[str]:
     pool = {
         "alpha": string.ascii_lowercase,
         "digits": string.digits,
         "alnum": string.ascii_lowercase + string.digits,
         "full": string.ascii_lowercase + string.digits + "_",
     }.get(charset, string.ascii_lowercase)
-    for combo in itertools.product(pool, repeat=length):
-        yield "".join(combo)
-
-
-def build_connector(proxy: Optional[str]) -> aiohttp.BaseConnector:
-    if proxy:
-        return ProxyConnector.from_url(proxy)
-    return aiohttp.TCPConnector(limit=0, ttl_dns_cache=300)
+    if shuffle:
+        all_names = ["".join(c) for c in itertools.product(pool, repeat=length)]
+        random.shuffle(all_names)
+        for n in all_names:
+            yield n
+    else:
+        for combo in itertools.product(pool, repeat=length):
+            yield "".join(combo)
 
 
 async def check_one(
     session: aiohttp.ClientSession,
     name: str,
-    retries: int = 3,
-) -> tuple[str, Optional[bool], Optional[str]]:
-    """return (name, available_bool_or_None, error_or_None)."""
-    payload = {"username": name}
-    backoff = 1.0
-    for attempt in range(retries):
-        try:
-            async with session.post(
-                ENDPOINT,
-                json=payload,
-                headers={
-                    "User-Agent": random.choice(UA_POOL),
-                    "Content-Type": "application/json",
-                    "Accept": "*/*",
-                    "Origin": "https://discord.com",
-                    "Referer": "https://discord.com/",
-                },
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as r:
-                if r.status == 429:
-                    retry_after = 1.0
-                    try:
-                        body = await r.json()
-                        retry_after = float(body.get("retry_after", 1.0))
-                    except Exception:
-                        pass
-                    await asyncio.sleep(min(retry_after, 10.0))
-                    return name, None, "ratelimit"
-                if r.status >= 500:
-                    await asyncio.sleep(backoff)
-                    backoff *= 2
-                    continue
-                if r.status != 200:
-                    text = (await r.text())[:120]
-                    return name, None, f"http{r.status}:{text}"
-                data = await r.json()
+    proxy: Optional[str],
+    timeout: float,
+) -> tuple[str, Optional[bool], Optional[str], Optional[float]]:
+    """
+    return (name, available_bool_or_None, error_str_or_None, retry_after_or_None).
+    """
+    try:
+        async with session.post(
+            ENDPOINT,
+            json={"username": name},
+            proxy=proxy,
+            headers={
+                "User-Agent": random.choice(UA_POOL),
+                "Content-Type": "application/json",
+                "Accept": "*/*",
+                "Origin": "https://discord.com",
+                "Referer": "https://discord.com/",
+            },
+            timeout=aiohttp.ClientTimeout(total=timeout, sock_connect=5),
+        ) as r:
+            if r.status == 429:
+                retry_after = 1.0
+                try:
+                    body = await r.json()
+                    retry_after = float(body.get("retry_after", 1.0))
+                except Exception:
+                    pass
+                return name, None, "ratelimit", retry_after
+            if r.status in (200, 201, 204):
+                try:
+                    data = await r.json()
+                except Exception:
+                    data = {}
                 taken = bool(data.get("taken", True))
-                return name, (not taken), None
-        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
-            await asyncio.sleep(backoff)
-            backoff *= 2
-            if attempt == retries - 1:
-                return name, None, f"net:{type(e).__name__}"
-    return name, None, "exhausted"
+                return name, (not taken), None, None
+            if r.status == 400:
+                return name, False, None, None  # discord said invalid; treat as taken
+            return name, None, f"http{r.status}", None
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+        return name, None, f"net:{type(e).__name__}", None
 
 
-def render(stats: Stats, config: dict) -> Panel:
+def render(stats: Stats, pool: ProxyPool, config: dict) -> Panel:
     tbl = Table.grid(expand=True)
     tbl.add_column(justify="left")
     tbl.add_column(justify="right")
@@ -186,13 +309,16 @@ def render(stats: Stats, config: dict) -> Panel:
     def row(k, v, style="white"):
         tbl.add_row(Text(k, style="dim"), Text(str(v), style=style))
 
+    row("requests", f"{stats.requests:,}", "cyan")
     row("checked", f"{stats.checked:,}", "cyan")
     row("available", f"{stats.available:,}", "bold green")
     row("taken", f"{stats.taken:,}", "red")
     row("invalid (skipped)", f"{stats.invalid:,}", "yellow")
     row("errors", f"{stats.errors:,}", "magenta")
     row("rate-limited", f"{stats.rate_limited:,}", "yellow")
-    row("rate", f"{stats.rps:,.1f} req/s", "cyan")
+    row("circuit opens", f"{stats.circuit_opens:,}", "yellow")
+    row("req rate", f"{stats.rps:,.1f}/s", "cyan")
+    row("check rate", f"{stats.check_rps:,.1f}/s", "cyan")
     row("elapsed", f"{stats.elapsed:,.1f}s", "white")
 
     hits_tbl = Table.grid(expand=True)
@@ -203,16 +329,13 @@ def render(stats: Stats, config: dict) -> Panel:
     else:
         hits_tbl.add_row(Text("  (none yet)", style="dim"))
 
-    pool = config.get("pool")
     proxies_str = (
-        f"{pool.alive_count}/{len(pool.proxies)}"
-        if pool and pool.proxies
-        else str(config["proxies"])
+        f"{pool.alive_count}/{len(pool.proxies)}" if pool.proxies else "none"
     )
     header = Text.assemble(
-        ("discord name checker", "bold white"),
+        ("discord name checker v2", "bold white"),
         ("  ·  ", "dim"),
-        (f"concurrency={config['concurrency']}", "cyan"),
+        (f"workers={config['concurrency']}", "cyan"),
         ("  ·  ", "dim"),
         (f"proxies={proxies_str}", "cyan"),
         ("  ·  ", "dim"),
@@ -226,83 +349,79 @@ def render(stats: Stats, config: dict) -> Panel:
     )
 
 
-async def producer(
-    names: AsyncIterator[str],
-    queue: asyncio.Queue,
-    stats: Stats,
-) -> None:
-    async for name in names:
-        name = name.strip().lower()
-        if not valid_name(name):
-            stats.invalid += 1
-            continue
-        await queue.put(name)
-    # sentinel per worker is handled by caller via None pushes
-
-
-async def _new_session(pool: ProxyPool) -> tuple[aiohttp.ClientSession, Optional[str]]:
-    proxy = pool.next()
-    return aiohttp.ClientSession(connector=build_connector(proxy)), proxy
-
-
 async def worker(
     worker_id: int,
+    session: aiohttp.ClientSession,
     queue: asyncio.Queue,
     stats: Stats,
     pool: ProxyPool,
+    cb: CircuitBreaker,
     out_file,
     stop: asyncio.Event,
+    webhook: Optional[WebhookBatcher],
     delay: float,
-    rotate_after: int,
-    kill_after: int,
+    timeout: float,
+    max_retries: int,
 ) -> None:
-    session, proxy = await _new_session(pool)
-    consecutive_bad = 0
-    try:
-        while not stop.is_set():
-            try:
-                name = await asyncio.wait_for(queue.get(), timeout=0.5)
-            except asyncio.TimeoutError:
-                continue
-            if name is None:
-                queue.task_done()
-                return
-            name, available, err = await check_one(session, name)
-            stats.checked += 1
+    while not stop.is_set():
+        try:
+            name = await asyncio.wait_for(queue.get(), timeout=0.5)
+        except asyncio.TimeoutError:
+            continue
+        if name is None:
+            queue.task_done()
+            return
+
+        attempt = 0
+        resolved = False
+        while attempt < max_retries and not stop.is_set():
+            attempt += 1
+            await cb.wait_if_open()
+            proxy = pool.next()
+            stats.requests += 1
+            name, available, err, retry_after = await check_one(session, name, proxy, timeout)
+
             if err == "ratelimit":
                 stats.rate_limited += 1
-                await queue.put(name)
-                consecutive_bad += 1
-            elif err is not None:
+                # ratelimited proxies get downgraded but not killed outright
+                pool.miss(proxy, kill_at=-10)
+                if retry_after and retry_after < 3:
+                    await asyncio.sleep(retry_after)
+                continue
+            if err is not None:
                 stats.errors += 1
-                consecutive_bad += 1
-            elif available:
+                pool.miss(proxy)
+                if cb.record_failure():
+                    stats.circuit_opens += 1
+                # tiny backoff per attempt
+                await asyncio.sleep(min(attempt * 0.1, 2.0))
+                continue
+
+            # verdict
+            stats.checked += 1
+            pool.hit(proxy)
+            resolved = True
+            if available:
                 stats.available += 1
                 stats.recent_hits.append(name)
                 out_file.write(name + "\n")
                 out_file.flush()
-                consecutive_bad = 0
+                if webhook:
+                    webhook.enqueue(name)
             else:
                 stats.taken += 1
-                consecutive_bad = 0
-            queue.task_done()
+            break
 
-            # mark proxy dead after too many consecutive failures
-            if consecutive_bad >= kill_after and pool.proxies:
-                pool.mark_dead(proxy)
-                await session.close()
-                session, proxy = await _new_session(pool)
-                consecutive_bad = 0
-            # otherwise just rotate — proxy might not be dead, just slapped
-            elif consecutive_bad >= rotate_after and pool.proxies:
-                await session.close()
-                session, proxy = await _new_session(pool)
-                consecutive_bad = 0
+        if not resolved:
+            # requeue once; if it still fails many pools over it's a dead name
+            try:
+                queue.put_nowait(name)
+            except Exception:
+                pass
 
-            if delay > 0:
-                await asyncio.sleep(delay)
-    finally:
-        await session.close()
+        queue.task_done()
+        if delay > 0:
+            await asyncio.sleep(delay)
 
 
 async def iter_source(args) -> AsyncIterator[str]:
@@ -310,7 +429,7 @@ async def iter_source(args) -> AsyncIterator[str]:
         for line in load_lines(Path(args.wordlist)):
             yield line
     if args.generate:
-        for n in generate(args.generate, args.charset):
+        for n in generate(args.generate, args.charset, shuffle=args.shuffle):
             yield n
     if args.names:
         for n in args.names:
@@ -318,15 +437,34 @@ async def iter_source(args) -> AsyncIterator[str]:
 
 
 async def run(args) -> int:
+    asyncio.get_running_loop().set_exception_handler(lambda loop, ctx: None)
+
     stats = Stats()
     proxies = load_lines(Path(args.proxies)) if args.proxies else []
-    pool = ProxyPool(proxies=proxies)
+    pool = ProxyPool(proxies=list(proxies))
+    cb = CircuitBreaker(threshold=args.circuit_threshold, window=2.0, cooldown=args.circuit_cooldown)
     queue: asyncio.Queue = asyncio.Queue(maxsize=args.concurrency * 4)
     stop = asyncio.Event()
 
     out_path = Path(args.out)
     out_file = out_path.open("a", encoding="utf-8")
     console = Console()
+
+    # one shared session for everything; proxy picked per-request
+    connector = aiohttp.TCPConnector(
+        limit=args.concurrency * 2,
+        limit_per_host=0,
+        enable_cleanup_closed=True,
+        ttl_dns_cache=300,
+    )
+    session = aiohttp.ClientSession(
+        connector=connector,
+        trust_env=False,
+        timeout=aiohttp.ClientTimeout(total=None, sock_connect=5, sock_read=30),
+    )
+
+    webhook = WebhookBatcher(args.webhook, session) if args.webhook else None
+    webhook_task = asyncio.create_task(webhook.run()) if webhook else None
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -338,10 +476,10 @@ async def run(args) -> int:
     workers = [
         asyncio.create_task(
             worker(
-                i, queue, stats, pool, out_file, stop,
+                i, session, queue, stats, pool, cb, out_file, stop, webhook,
                 delay=args.delay,
-                rotate_after=args.rotate_after,
-                kill_after=args.kill_after,
+                timeout=args.timeout,
+                max_retries=args.max_retries,
             )
         )
         for i in range(args.concurrency)
@@ -361,30 +499,30 @@ async def run(args) -> int:
 
     feeder = asyncio.create_task(feed())
 
-    config = {
-        "concurrency": args.concurrency,
-        "proxies": f"{pool.alive_count}/{len(proxies)}" if proxies else "none",
-        "out": str(out_path),
-        "pool": pool,
-    }
+    config = {"concurrency": args.concurrency, "out": str(out_path)}
 
-    with Live(render(stats, config), console=console, refresh_per_second=8, screen=False) as live:
+    with Live(render(stats, pool, config), console=console, refresh_per_second=6, screen=False) as live:
         try:
             while not stop.is_set():
-                live.update(render(stats, config))
+                live.update(render(stats, pool, config))
                 if feeder.done() and queue.empty():
                     break
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.15)
         finally:
             stop.set()
             feeder.cancel()
+            if webhook:
+                webhook.stop()
             await asyncio.gather(*workers, return_exceptions=True)
-            live.update(render(stats, config))
+            if webhook_task:
+                await asyncio.gather(webhook_task, return_exceptions=True)
+            live.update(render(stats, pool, config))
 
     out_file.close()
+    await session.close()
     console.print(
         f"[bold green]done.[/] {stats.available} available / {stats.checked} checked "
-        f"in {stats.elapsed:.1f}s — saved to [cyan]{out_path}[/]"
+        f"({stats.requests} requests) in {stats.elapsed:.1f}s — saved to [cyan]{out_path}[/]"
     )
     return 0
 
@@ -398,22 +536,27 @@ def parse_args() -> argparse.Namespace:
         "--charset", "-c",
         choices=["alpha", "digits", "alnum", "full"],
         default="alpha",
-        help="charset for --generate (default: alpha)",
     )
-    src.add_argument("--names", "-n", nargs="*", help="inline names to check")
+    src.add_argument("--names", "-n", nargs="*", help="inline names")
+    src.add_argument("--shuffle", "-s", action="store_true", help="randomize generation order")
 
     net = p.add_argument_group("network")
-    net.add_argument("--concurrency", "-j", type=int, default=25, help="concurrent workers")
-    net.add_argument("--proxies", "-p", help="file of proxy URLs (http://, socks5://)")
+    net.add_argument("--concurrency", "-j", type=int, default=50)
+    net.add_argument("--proxies", "-p", help="file of proxy URLs")
     net.add_argument("--delay", "-d", type=float, default=0.0,
-                     help="seconds each worker sleeps between requests (slows pressure per proxy)")
-    net.add_argument("--rotate-after", type=int, default=2,
-                     help="rotate proxy after N consecutive 429/errors (default 2)")
-    net.add_argument("--kill-after", type=int, default=6,
-                     help="drop proxy from pool after N consecutive 429/errors (default 6)")
+                     help="per-worker sleep between requests")
+    net.add_argument("--timeout", "-t", type=float, default=10.0,
+                     help="per-request total timeout (s)")
+    net.add_argument("--max-retries", type=int, default=12,
+                     help="attempts per name before requeue")
+    net.add_argument("--circuit-threshold", type=int, default=30,
+                     help="connection failures in 2s that trip the circuit")
+    net.add_argument("--circuit-cooldown", type=float, default=2.0,
+                     help="seconds all workers pause when circuit opens")
 
     out = p.add_argument_group("output")
-    out.add_argument("--out", "-o", default="hits.txt", help="file to append hits to")
+    out.add_argument("--out", "-o", default="hits.txt")
+    out.add_argument("--webhook", help="discord webhook URL for live hit notifications")
 
     args = p.parse_args()
     if not (args.wordlist or args.generate or args.names):
@@ -422,9 +565,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
-    args = parse_args()
     try:
-        return asyncio.run(run(args))
+        return asyncio.run(run(parse_args()))
     except KeyboardInterrupt:
         return 130
 
