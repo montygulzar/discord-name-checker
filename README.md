@@ -44,6 +44,36 @@ Names are validated against Pomelo rules (2–32 chars, `[a-z0-9_.]`, no leading
 trailing/doubled dots) before hitting the wire — invalid entries don't burn a
 request.
 
+## Free proxies
+
+`fetch_proxies.py` scrapes a dozen public SOCKS5/HTTP lists, tests every entry
+against Discord in parallel, and writes the survivors to `proxies.txt`
+sorted fastest-first.
+
+```bash
+python fetch_proxies.py --out proxies.txt --timeout 5 --concurrency 500
+```
+
+Free proxies die fast — refresh every ~10 min while a long run is going:
+
+```bash
+# bash: refresh loop in a side terminal
+while true; do python fetch_proxies.py --out proxies.txt; sleep 600; done
+```
+
+Workflow:
+
+```bash
+# terminal 1 — keep the pool fresh
+while true; do python fetch_proxies.py -o proxies.txt; sleep 600; done
+
+# terminal 2 — run the checker
+python checker.py --wordlist names.txt --proxies proxies.txt -j 200
+```
+
+Expect maybe 5–20% of scraped proxies to actually reach Discord, so start the
+checker's `-j` around the live count (shown at end of the fetch run).
+
 ## Notes
 
 - 429s are honoured via `retry_after` and the name is requeued.
