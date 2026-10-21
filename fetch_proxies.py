@@ -14,9 +14,22 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import sys
 import time
+import warnings
 from pathlib import Path
+
+# silence windows proactor ConnectionReset tracebacks on session teardown —
+# the except in test_one catches the result; this just drops the noisy
+# post-mortem that asyncio prints from _call_connection_lost / __del__.
+warnings.filterwarnings("ignore", category=ResourceWarning)
+logging.getLogger("asyncio").setLevel(logging.CRITICAL)
+if sys.platform == "win32":
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    except Exception:
+        pass
 
 import aiohttp
 from aiohttp_socks import ProxyConnector
@@ -108,6 +121,8 @@ async def test_one(url: str, test_url: str, timeout: float, sem: asyncio.Semapho
 
 
 async def run(args: argparse.Namespace) -> int:
+    # swallow any still-unhandled transport exceptions silently (windows proactor)
+    asyncio.get_running_loop().set_exception_handler(lambda loop, ctx: None)
     pool = await gather_sources()
     if not pool:
         console.print("[red]no proxies pulled — check your network[/]")
