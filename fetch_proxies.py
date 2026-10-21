@@ -79,17 +79,30 @@ async def gather_sources() -> set[str]:
     return pool
 
 
+async def _probe(url: str, test_url: str, timeout: float) -> tuple[str, bool, float]:
+    t0 = time.monotonic()
+    try:
+        async with aiohttp.ClientSession(
+            connector=ProxyConnector.from_url(url),
+            timeout=aiohttp.ClientTimeout(total=timeout, connect=timeout),
+        ) as s:
+            async with s.get(test_url) as r:
+                ok = r.status < 500 and r.status != 403
+                return url, ok, time.monotonic() - t0
+    except Exception:
+        return url, False, time.monotonic() - t0
+
+
 async def test_one(url: str, test_url: str, timeout: float, sem: asyncio.Semaphore) -> tuple[str, bool, float]:
     async with sem:
-        t0 = time.monotonic()
+        # hard outer bound — some socks handshakes ignore inner timeouts and hang
         try:
-            async with aiohttp.ClientSession(
-                connector=ProxyConnector.from_url(url),
-                timeout=aiohttp.ClientTimeout(total=timeout),
-            ) as s:
-                async with s.get(test_url) as r:
-                    ok = r.status < 500 and r.status != 403
-                    return url, ok, time.monotonic() - t0
+            return await asyncio.wait_for(
+                _probe(url, test_url, timeout),
+                timeout=timeout + 3,
+            )
+        except asyncio.TimeoutError:
+            return url, False, timeout + 3
         except Exception:
             return url, False, timeout
 
