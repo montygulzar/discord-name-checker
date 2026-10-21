@@ -75,13 +75,27 @@ class Stats:
 class ProxyPool:
     proxies: list[str]
     idx: int = 0
+    dead: set = field(default_factory=set)
 
     def next(self) -> Optional[str]:
         if not self.proxies:
             return None
-        p = self.proxies[self.idx % len(self.proxies)]
+        alive = [p for p in self.proxies if p not in self.dead]
+        if not alive:
+            # everyone's dead — unmark and try again rather than crashing
+            self.dead.clear()
+            alive = self.proxies
+        p = alive[self.idx % len(alive)]
         self.idx += 1
         return p
+
+    def mark_dead(self, proxy: Optional[str]) -> None:
+        if proxy:
+            self.dead.add(proxy)
+
+    @property
+    def alive_count(self) -> int:
+        return max(len(self.proxies) - len(self.dead), 0)
 
 
 def valid_name(name: str) -> bool:
@@ -189,12 +203,18 @@ def render(stats: Stats, config: dict) -> Panel:
     else:
         hits_tbl.add_row(Text("  (none yet)", style="dim"))
 
+    pool = config.get("pool")
+    proxies_str = (
+        f"{pool.alive_count}/{len(pool.proxies)}"
+        if pool and pool.proxies
+        else str(config["proxies"])
+    )
     header = Text.assemble(
         ("discord name checker", "bold white"),
         ("  ·  ", "dim"),
         (f"concurrency={config['concurrency']}", "cyan"),
         ("  ·  ", "dim"),
-        (f"proxies={config['proxies']}", "cyan"),
+        (f"proxies={proxies_str}", "cyan"),
         ("  ·  ", "dim"),
         (f"out={config['out']}", "cyan"),
     )
@@ -220,6 +240,11 @@ async def producer(
     # sentinel per worker is handled by caller via None pushes
 
 
+async def _new_session(pool: ProxyPool) -> tuple[aiohttp.ClientSession, Optional[str]]:
+    proxy = pool.next()
+    return aiohttp.ClientSession(connector=build_connector(proxy)), proxy
+
+
 async def worker(
     worker_id: int,
     queue: asyncio.Queue,
@@ -227,10 +252,12 @@ async def worker(
     pool: ProxyPool,
     out_file,
     stop: asyncio.Event,
+    delay: float,
+    rotate_after: int,
+    kill_after: int,
 ) -> None:
-    proxy = pool.next()
-    connector = build_connector(proxy)
-    session = aiohttp.ClientSession(connector=connector)
+    session, proxy = await _new_session(pool)
+    consecutive_bad = 0
     try:
         while not stop.is_set():
             try:
@@ -244,17 +271,36 @@ async def worker(
             stats.checked += 1
             if err == "ratelimit":
                 stats.rate_limited += 1
-                await queue.put(name)  # requeue
+                await queue.put(name)
+                consecutive_bad += 1
             elif err is not None:
                 stats.errors += 1
+                consecutive_bad += 1
             elif available:
                 stats.available += 1
                 stats.recent_hits.append(name)
                 out_file.write(name + "\n")
                 out_file.flush()
+                consecutive_bad = 0
             else:
                 stats.taken += 1
+                consecutive_bad = 0
             queue.task_done()
+
+            # mark proxy dead after too many consecutive failures
+            if consecutive_bad >= kill_after and pool.proxies:
+                pool.mark_dead(proxy)
+                await session.close()
+                session, proxy = await _new_session(pool)
+                consecutive_bad = 0
+            # otherwise just rotate — proxy might not be dead, just slapped
+            elif consecutive_bad >= rotate_after and pool.proxies:
+                await session.close()
+                session, proxy = await _new_session(pool)
+                consecutive_bad = 0
+
+            if delay > 0:
+                await asyncio.sleep(delay)
     finally:
         await session.close()
 
@@ -290,7 +336,14 @@ async def run(args) -> int:
             pass
 
     workers = [
-        asyncio.create_task(worker(i, queue, stats, pool, out_file, stop))
+        asyncio.create_task(
+            worker(
+                i, queue, stats, pool, out_file, stop,
+                delay=args.delay,
+                rotate_after=args.rotate_after,
+                kill_after=args.kill_after,
+            )
+        )
         for i in range(args.concurrency)
     ]
 
@@ -310,8 +363,9 @@ async def run(args) -> int:
 
     config = {
         "concurrency": args.concurrency,
-        "proxies": len(proxies) or "none",
+        "proxies": f"{pool.alive_count}/{len(proxies)}" if proxies else "none",
         "out": str(out_path),
+        "pool": pool,
     }
 
     with Live(render(stats, config), console=console, refresh_per_second=8, screen=False) as live:
@@ -351,6 +405,12 @@ def parse_args() -> argparse.Namespace:
     net = p.add_argument_group("network")
     net.add_argument("--concurrency", "-j", type=int, default=25, help="concurrent workers")
     net.add_argument("--proxies", "-p", help="file of proxy URLs (http://, socks5://)")
+    net.add_argument("--delay", "-d", type=float, default=0.0,
+                     help="seconds each worker sleeps between requests (slows pressure per proxy)")
+    net.add_argument("--rotate-after", type=int, default=2,
+                     help="rotate proxy after N consecutive 429/errors (default 2)")
+    net.add_argument("--kill-after", type=int, default=6,
+                     help="drop proxy from pool after N consecutive 429/errors (default 6)")
 
     out = p.add_argument_group("output")
     out.add_argument("--out", "-o", default="hits.txt", help="file to append hits to")

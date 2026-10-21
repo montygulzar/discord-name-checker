@@ -14,9 +14,22 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import sys
 import time
+import warnings
 from pathlib import Path
+
+# silence windows proactor ConnectionReset tracebacks on session teardown —
+# the except in test_one catches the result; this just drops the noisy
+# post-mortem that asyncio prints from _call_connection_lost / __del__.
+warnings.filterwarnings("ignore", category=ResourceWarning)
+logging.getLogger("asyncio").setLevel(logging.CRITICAL)
+if sys.platform == "win32":
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    except Exception:
+        pass
 
 import aiohttp
 from aiohttp_socks import ProxyConnector
@@ -79,22 +92,37 @@ async def gather_sources() -> set[str]:
     return pool
 
 
+async def _probe(url: str, test_url: str, timeout: float) -> tuple[str, bool, float]:
+    t0 = time.monotonic()
+    try:
+        async with aiohttp.ClientSession(
+            connector=ProxyConnector.from_url(url),
+            timeout=aiohttp.ClientTimeout(total=timeout, connect=timeout),
+        ) as s:
+            async with s.get(test_url) as r:
+                ok = r.status < 500 and r.status != 403
+                return url, ok, time.monotonic() - t0
+    except Exception:
+        return url, False, time.monotonic() - t0
+
+
 async def test_one(url: str, test_url: str, timeout: float, sem: asyncio.Semaphore) -> tuple[str, bool, float]:
     async with sem:
-        t0 = time.monotonic()
+        # hard outer bound — some socks handshakes ignore inner timeouts and hang
         try:
-            async with aiohttp.ClientSession(
-                connector=ProxyConnector.from_url(url),
-                timeout=aiohttp.ClientTimeout(total=timeout),
-            ) as s:
-                async with s.get(test_url) as r:
-                    ok = r.status < 500 and r.status != 403
-                    return url, ok, time.monotonic() - t0
+            return await asyncio.wait_for(
+                _probe(url, test_url, timeout),
+                timeout=timeout + 3,
+            )
+        except asyncio.TimeoutError:
+            return url, False, timeout + 3
         except Exception:
             return url, False, timeout
 
 
 async def run(args: argparse.Namespace) -> int:
+    # swallow any still-unhandled transport exceptions silently (windows proactor)
+    asyncio.get_running_loop().set_exception_handler(lambda loop, ctx: None)
     pool = await gather_sources()
     if not pool:
         console.print("[red]no proxies pulled — check your network[/]")
@@ -103,25 +131,34 @@ async def run(args: argparse.Namespace) -> int:
     sem = asyncio.Semaphore(args.concurrency)
     tasks = [test_one(p, args.test_url, args.timeout, sem) for p in pool]
 
-    live: list[tuple[str, float]] = []
-    with Progress(
-        TextColumn("[cyan]testing"),
-        BarColumn(bar_width=40),
-        TextColumn("{task.completed}/{task.total}"),
-        TextColumn("· [green]live: {task.fields[live]}[/]"),
-        TimeElapsedColumn(),
-        console=console,
-    ) as prog:
-        task = prog.add_task("test", total=len(tasks), live=0)
-        for coro in asyncio.as_completed(tasks):
-            url, ok, elapsed = await coro
-            if ok:
-                live.append((url, elapsed))
-                prog.update(task, live=len(live))
-            prog.update(task, advance=1)
-
-    live.sort(key=lambda x: x[1])  # fastest first
+    # write survivors as they come in so ctrl-c never costs you the pool.
+    # final rewrite at the end sorts fastest-first.
     out = Path(args.out)
+    live: list[tuple[str, float]] = []
+    out_fh = out.open("w", encoding="utf-8")
+    try:
+        with Progress(
+            TextColumn("[cyan]testing"),
+            BarColumn(bar_width=40),
+            TextColumn("{task.completed}/{task.total}"),
+            TextColumn("· [green]live: {task.fields[live]}[/]"),
+            TimeElapsedColumn(),
+            console=console,
+        ) as prog:
+            task = prog.add_task("test", total=len(tasks), live=0)
+            for coro in asyncio.as_completed(tasks):
+                url, ok, elapsed = await coro
+                if ok:
+                    live.append((url, elapsed))
+                    out_fh.write(url + "\n")
+                    out_fh.flush()
+                    prog.update(task, live=len(live))
+                prog.update(task, advance=1)
+    finally:
+        out_fh.close()
+
+    # rewrite sorted fastest-first
+    live.sort(key=lambda x: x[1])
     out.write_text("\n".join(u for u, _ in live) + ("\n" if live else ""))
     console.print(
         f"[bold green]done.[/] {len(live):,}/{len(pool):,} alive — "
