@@ -48,6 +48,7 @@ from pathlib import Path
 from typing import AsyncIterator, Iterable, Optional
 
 import aiohttp
+from aiohttp_socks import ProxyConnector
 from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
@@ -256,10 +257,22 @@ def generate(length: int, charset: str, shuffle: bool = False) -> Iterable[str]:
             yield "".join(combo)
 
 
+def _build_session(proxy: Optional[str]) -> aiohttp.ClientSession:
+    """Session bound to one proxy. aiohttp_socks handles http:// and socks5://."""
+    if proxy:
+        connector = ProxyConnector.from_url(proxy)
+    else:
+        connector = aiohttp.TCPConnector(limit=0, ttl_dns_cache=300)
+    return aiohttp.ClientSession(
+        connector=connector,
+        trust_env=False,
+        timeout=aiohttp.ClientTimeout(total=None, sock_connect=5, sock_read=30),
+    )
+
+
 async def check_one(
     session: aiohttp.ClientSession,
     name: str,
-    proxy: Optional[str],
     timeout: float,
 ) -> tuple[str, Optional[bool], Optional[str], Optional[float]]:
     """
@@ -269,7 +282,6 @@ async def check_one(
         async with session.post(
             ENDPOINT,
             json={"username": name},
-            proxy=proxy,
             headers={
                 "User-Agent": random.choice(UA_POOL),
                 "Content-Type": "application/json",
@@ -351,7 +363,6 @@ def render(stats: Stats, pool: ProxyPool, config: dict) -> Panel:
 
 async def worker(
     worker_id: int,
-    session: aiohttp.ClientSession,
     queue: asyncio.Queue,
     stats: Stats,
     pool: ProxyPool,
@@ -363,65 +374,90 @@ async def worker(
     timeout: float,
     max_retries: int,
 ) -> None:
-    while not stop.is_set():
-        try:
-            name = await asyncio.wait_for(queue.get(), timeout=0.5)
-        except asyncio.TimeoutError:
-            continue
-        if name is None:
-            queue.task_done()
-            return
+    """Each worker owns a session bound to one proxy (via aiohttp_socks).
+    On rotate/kill the whole session is torn down and rebuilt."""
+    proxy = pool.next()
+    try:
+        session = _build_session(proxy)
+    except Exception:
+        pool.miss(proxy)
+        proxy = pool.next()
+        session = _build_session(proxy)
+    consecutive_bad = 0
 
-        attempt = 0
-        resolved = False
-        while attempt < max_retries and not stop.is_set():
-            attempt += 1
-            await cb.wait_if_open()
-            proxy = pool.next()
-            stats.requests += 1
-            name, available, err, retry_after = await check_one(session, name, proxy, timeout)
-
-            if err == "ratelimit":
-                stats.rate_limited += 1
-                # ratelimited proxies get downgraded but not killed outright
-                pool.miss(proxy, kill_at=-10)
-                if retry_after and retry_after < 3:
-                    await asyncio.sleep(retry_after)
-                continue
-            if err is not None:
-                stats.errors += 1
-                pool.miss(proxy)
-                if cb.record_failure():
-                    stats.circuit_opens += 1
-                # tiny backoff per attempt
-                await asyncio.sleep(min(attempt * 0.1, 2.0))
-                continue
-
-            # verdict
-            stats.checked += 1
-            pool.hit(proxy)
-            resolved = True
-            if available:
-                stats.available += 1
-                stats.recent_hits.append(name)
-                out_file.write(name + "\n")
-                out_file.flush()
-                if webhook:
-                    webhook.enqueue(name)
-            else:
-                stats.taken += 1
-            break
-
-        if not resolved:
-            # requeue once; if it still fails many pools over it's a dead name
+    try:
+        while not stop.is_set():
             try:
-                queue.put_nowait(name)
-            except Exception:
-                pass
+                name = await asyncio.wait_for(queue.get(), timeout=0.5)
+            except asyncio.TimeoutError:
+                continue
+            if name is None:
+                queue.task_done()
+                return
 
-        queue.task_done()
-        if delay > 0:
-            await asyncio.sleep(delay)
+            attempt = 0
+            resolved = False
+            while attempt < max_retries and not stop.is_set():
+                attempt += 1
+                await cb.wait_if_open()
+                stats.requests += 1
+                _name, available, err, retry_after = await check_one(session, name, timeout)
+
+                if err == "ratelimit":
+                    stats.rate_limited += 1
+                    pool.miss(proxy, kill_at=-10)
+                    consecutive_bad += 1
+                    if retry_after and retry_after < 3:
+                        await asyncio.sleep(retry_after)
+                elif err is not None:
+                    stats.errors += 1
+                    pool.miss(proxy)
+                    consecutive_bad += 1
+                    if cb.record_failure():
+                        stats.circuit_opens += 1
+                    await asyncio.sleep(min(attempt * 0.1, 2.0))
+                else:
+                    stats.checked += 1
+                    pool.hit(proxy)
+                    consecutive_bad = 0
+                    resolved = True
+                    if available:
+                        stats.available += 1
+                        stats.recent_hits.append(name)
+                        out_file.write(name + "\n")
+                        out_file.flush()
+                        if webhook:
+                            webhook.enqueue(name)
+                    else:
+                        stats.taken += 1
+                    break
+
+                # rotate on 2 consecutive bad
+                if consecutive_bad >= 2 and pool.proxies:
+                    await session.close()
+                    proxy = pool.next()
+                    try:
+                        session = _build_session(proxy)
+                    except Exception:
+                        pool.miss(proxy)
+                        proxy = pool.next()
+                        session = _build_session(proxy)
+                    consecutive_bad = 0
+
+            if not resolved:
+                try:
+                    queue.put_nowait(name)
+                except Exception:
+                    pass
+
+            queue.task_done()
+            if delay > 0:
+                await asyncio.sleep(delay)
+    finally:
+        try:
+            await session.close()
+        except Exception:
+            pass
 
 
 async def iter_source(args) -> AsyncIterator[str]:
@@ -450,20 +486,14 @@ async def run(args) -> int:
     out_file = out_path.open("a", encoding="utf-8")
     console = Console()
 
-    # one shared session for everything; proxy picked per-request
-    connector = aiohttp.TCPConnector(
-        limit=args.concurrency * 2,
-        limit_per_host=0,
-        enable_cleanup_closed=True,
-        ttl_dns_cache=300,
-    )
-    session = aiohttp.ClientSession(
-        connector=connector,
+    # tiny direct session purely for webhook posts (bypass proxies)
+    webhook_session = aiohttp.ClientSession(
+        connector=aiohttp.TCPConnector(limit=4),
         trust_env=False,
-        timeout=aiohttp.ClientTimeout(total=None, sock_connect=5, sock_read=30),
-    )
+        timeout=aiohttp.ClientTimeout(total=15),
+    ) if args.webhook else None
 
-    webhook = WebhookBatcher(args.webhook, session) if args.webhook else None
+    webhook = WebhookBatcher(args.webhook, webhook_session) if args.webhook else None
     webhook_task = asyncio.create_task(webhook.run()) if webhook else None
 
     loop = asyncio.get_running_loop()
@@ -476,7 +506,7 @@ async def run(args) -> int:
     workers = [
         asyncio.create_task(
             worker(
-                i, session, queue, stats, pool, cb, out_file, stop, webhook,
+                i, queue, stats, pool, cb, out_file, stop, webhook,
                 delay=args.delay,
                 timeout=args.timeout,
                 max_retries=args.max_retries,
@@ -519,7 +549,8 @@ async def run(args) -> int:
             live.update(render(stats, pool, config))
 
     out_file.close()
-    await session.close()
+    if webhook_session:
+        await webhook_session.close()
     console.print(
         f"[bold green]done.[/] {stats.available} available / {stats.checked} checked "
         f"({stats.requests} requests) in {stats.elapsed:.1f}s — saved to [cyan]{out_path}[/]"
