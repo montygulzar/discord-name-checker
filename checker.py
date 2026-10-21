@@ -220,6 +220,11 @@ async def producer(
     # sentinel per worker is handled by caller via None pushes
 
 
+async def _new_session(pool: ProxyPool) -> tuple[aiohttp.ClientSession, Optional[str]]:
+    proxy = pool.next()
+    return aiohttp.ClientSession(connector=build_connector(proxy)), proxy
+
+
 async def worker(
     worker_id: int,
     queue: asyncio.Queue,
@@ -228,9 +233,8 @@ async def worker(
     out_file,
     stop: asyncio.Event,
 ) -> None:
-    proxy = pool.next()
-    connector = build_connector(proxy)
-    session = aiohttp.ClientSession(connector=connector)
+    session, proxy = await _new_session(pool)
+    consecutive_bad = 0
     try:
         while not stop.is_set():
             try:
@@ -244,17 +248,27 @@ async def worker(
             stats.checked += 1
             if err == "ratelimit":
                 stats.rate_limited += 1
-                await queue.put(name)  # requeue
+                await queue.put(name)  # requeue onto another worker
+                consecutive_bad += 1
             elif err is not None:
                 stats.errors += 1
+                consecutive_bad += 1
             elif available:
                 stats.available += 1
                 stats.recent_hits.append(name)
                 out_file.write(name + "\n")
                 out_file.flush()
+                consecutive_bad = 0
             else:
                 stats.taken += 1
+                consecutive_bad = 0
             queue.task_done()
+
+            # rotate proxy if this one keeps getting slapped or erroring
+            if consecutive_bad >= 2 and pool.proxies:
+                await session.close()
+                session, proxy = await _new_session(pool)
+                consecutive_bad = 0
     finally:
         await session.close()
 
